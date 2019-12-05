@@ -1,0 +1,104 @@
+---
+title: "Human Activity Recognition Study"
+output:
+  html_document:
+    keep_md: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(caret)
+library(dplyr)
+library(doMC)
+library(randomForest)
+
+doMC::registerDoMC(cores=4)
+```
+
+## Synopsis
+
+Participants in study were asked to perform different excercises with measurements taken using accelerometers on the belt, forearm, arm, and dumbell. These measurements are then used to predict what excercises are performed.
+
+## Data Processing
+
+The data is read in and split the data into the training and testing sets using a 60% split for training based on the "classe", which is the variable we are trying to predict. Models will be trained on the training set and tested on the testing set in order to prevent overfitting. The holdout set with unknown "classe" which we will later try to predict is also brought in and held until later.
+
+```{r dataprocessing}
+data <- read.table("pmltraining.csv", header = TRUE, sep = ',', quote = '\"', dec='.', na.strings = c('NA', '#DIV/0!', 'NULL', ''))[8:160]
+test <- read.table("pmltesting.csv", header = TRUE, sep = ',', quote = '\"', dec = '.', na.strings = c('NA', '#DIV/0!', 'NULL', ''))[8:159]
+
+test[sapply(test, is.logical)] <- lapply(test[sapply(test, is.logical)], as.numeric)
+
+inTrain <- createDataPartition(y=data$classe, p=0.6, list = FALSE)
+train <- data[inTrain,]
+val <- data[-inTrain,]
+```
+
+Next data cleaning steps are performed. Variables with near zero variance are removed and BoxCox transformation and k-nearest neighbors imputation are applied. BoxCox will attempt to normalize the data for PCA and knnImpute will fill in missing values which could be troublesome for some algorithms. The same cleaning and preprocess objects from the training set is applied on the test and holdout set.
+
+```{r datacleaning}
+keepVar <- row.names(subset(nearZeroVar(train, saveMetrics = TRUE), nzv == FALSE))
+
+cleanTrain <- select(train, one_of(keepVar))
+cleanVal <- select(val, one_of(keepVar))
+cleanTest <- bind_cols(select(test, one_of(keepVar[1:124])), classe = rep('', times = 20))
+
+preProc1 <- preProcess(cleanTrain, method = c('BoxCox','knnImpute'))
+trainPP1 <- predict(preProc1, cleanTrain)
+valPP1 <- predict(preProc1, cleanVal)
+testPP1 <- predict(preProc1, cleanTest)
+```
+
+PCA is performed. Since there are 150+ variables in the dataset, the selected model will likely overfit the data if the variables are used as is. PCA will create weighted combinations of the variables which will make overfitting less likely. Again the same PCA from the training set is applied on the test and holdout sets in order to get good out of sample accuracy metrics.
+
+```{r PCA}
+preProc2 <- preProcess(trainPP1, method = 'pca', thresh = 0.9)
+trainPP2 <- predict(preProc2, trainPP1)
+trainPP2 <- bind_cols(trainPP2[,-1], classe = train$classe)
+valPP2 <- predict(preProc2, valPP1)
+valPP2 <- bind_cols(valPP2[,-1], classe = val$classe)
+testPP2 <- predict(preProc2, testPP1)
+```
+
+Plot shows the separation of the different "classe" by the first two principle components.
+
+```{r PCA_plot}
+qplot(x=PC1, y=PC2, color=classe, data=trainPP2, geom="point")
+```
+
+## Prediction
+
+Random forest and boosting algorithms are applied on the training set. k-fold cross validation is used within the training set with 10 folds so that multiple models can be fitted then tested and the best candidate model chosen.
+
+```{r models}
+trainContrl <- trainControl(method = 'cv', number = 10)
+
+modFitRF <- train(classe ~ ., method = 'rf', trControl = trainContrl, data = trainPP2)
+modFitBo <- train(classe ~ ., method = 'gbm', trControl = trainContrl, data = trainPP2, verbose = FALSE)
+```
+
+The candidate random forest and boosting models are then applied on the testing set to determine the out of sample error. Comparison of the accuracy metrics indicates that the random forest model performs much better than the boosting model.
+
+```{r accuracy}
+rfPredVal <- predict(modFitRF, valPP2)
+boPredVal <- predict(modFitBo, valPP2)
+
+confusionMatrix(val$classe, rfPredVal)
+confusionMatrix(val$classe, boPredVal)
+```
+
+The below plot shows the spread of the random forest predictions by the first two principle components are whether the predictions are correct.
+
+```{r rfplot}
+valPP2$predRight <- rfPredVal==valPP2$classe
+qplot(PC1, PC2, colour=predRight, data=valPP2)
+```
+
+The final step attempts to predict the previosuly unknown "classe" on the 20 observation holdout set.
+
+```{r finalModel}
+finalModFit <- predict(modFitRF, testPP2)
+```
+
+The predictions for the 20 observations are: `r finalModFit`. The out of sample error is estimated to be:
